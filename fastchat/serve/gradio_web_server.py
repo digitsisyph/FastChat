@@ -11,6 +11,10 @@ import os
 import random
 import time
 import uuid
+import re
+from e2b import Sandbox
+from e2b_code_interpreter import CodeInterpreter
+from gradio_iframe import iFrame
 
 import gradio as gr
 import requests
@@ -400,6 +404,152 @@ def is_limit_reached(model_name, ip):
         return None
 
 
+def extract_code_from_markdown(message: str) -> tuple[str, bool]:
+    # Regular expression to match code blocks
+    code_block_regex = r'```(?:\w+\n)?(.*?)```'
+    matches = re.findall(code_block_regex, message, re.DOTALL)
+
+    if 'typescript' or 'javascript' or 'react' or 'React' in message:
+        # hardcode for now
+        is_webpage = True
+    else:
+        is_webpage = False
+    print("IS WEBPAGE", is_webpage)
+
+    if matches:
+        # Return the first code block found
+        return matches[0].strip(), is_webpage
+    else:
+        # If no code block is found, return the entire message
+        return message.strip(), is_webpage
+
+
+def render_result(result):
+    if result.png:
+        if isinstance(result.png, str):
+            img_str = result.png
+        else:
+            img_str = base64.b64encode(result.png).decode()
+        return f"<img src='data:image/png;base64,{img_str}'>"
+    elif result.jpeg:
+        if isinstance(result.jpeg, str):
+            img_str = result.jpeg
+        else:
+            img_str = base64.b64encode(result.jpeg).decode()
+        return f"<img src='data:image/jpeg;base64,{img_str}'>"
+    elif result.svg:
+        return result.svg
+    elif result.html:
+        return result.html
+    elif result.markdown:
+        return f"```markdown\n{result.markdown}\n```"
+    elif result.latex:
+        return f"```latex\n{result.latex}\n```"
+    elif result.json:
+        return f"```json\n{result.json}\n```"
+    elif result.javascript:
+        return result.javascript  # Return raw JavaScript
+    else:
+        return str(result)
+
+
+def run_code_interpreter(code: str, is_webpage: bool) -> tuple[str, str, str]:
+    """
+    Executes the provided code within a sandboxed environment and returns the output.
+
+    Args:
+        code (str): The code to be executed.
+
+    Returns:
+        tuple[str, str, str]: A tuple containing the standard output, rendered results, and JavaScript code.
+    """
+    if not is_webpage:
+        with CodeInterpreter() as sandbox:
+            execution = sandbox.notebook.exec_cell(code)
+            std = dict(execution.logs)
+            stdout = "\n".join(std["stdout"])
+            stderr = "\n".join(std["stderr"])
+            output = ""
+            if stdout:
+                output += f"### Stdout:\n```\n{stdout}\n```\n\n"
+            if stderr:
+                output += f"### Stderr:\n```\n{stderr}\n```\n\n"
+
+            results = []
+            js_code = ""
+            for result in execution.results:
+                rendered_result = render_result(result)
+                if result.javascript:
+                    js_code += rendered_result + "\n"
+                else:
+                    results.append(rendered_result)
+            return output, "\n".join(results), js_code
+    else:
+        sandbox = Sandbox(
+            template="nextjs-developer",
+            metadata={
+                "template": "nextjs-developer"
+            },
+        )
+        sandbox.filesystem.make_dir('pages')
+        file_path = "~/pages/index.tsx"
+        sandbox.filesystem.write(file_path, code, 60)
+        print("WRITING FILE", file_path, code)
+
+        print("READ FILE", sandbox.filesystem.read(file_path))
+        sandbox_url = 'https://' + sandbox.get_hostname(3000)
+        print("SANDBOX URL", sandbox_url)
+        return sandbox_url
+
+
+def on_chat_click(state, evt: gr.SelectData):
+    iframe_component = iFrame(
+        label="iFrame Example",
+        value=("""
+        <iframe width="560" 
+            height="315" 
+            src="www.youtube.com/embed/dQw4w9WgXcQ?si=QfHLpHZsI98oZT1G" 
+            title="YouTube video player" 
+            frameborder="0" 
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
+            allowfullscreen>
+        </iframe>"""),
+        show_label=True,
+        visible=False)
+
+    if evt.value.endswith("<button style='background-color: #4CAF50; border: none; color: white; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 12px;' onclick='runInSandbox()'>Run in Sandbox</button>"):
+        message = evt.value.replace("<button style='background-color: #4CAF50; border: none; color: white; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 12px;' onclick='runInSandbox()'>Run in Sandbox</button>", "").strip()
+        code, is_web_page = extract_code_from_markdown(message)
+        if code:
+            if is_web_page:
+                url = run_code_interpreter(code, is_web_page)
+
+                return gr.Markdown(value="", visible=True), gr.HTML(value="", visible=False), iFrame(
+                    label="iFrame Example",
+                    value=(f"""
+                    <iframe width="560" 
+                        height="315" 
+                        src="{url}" 
+                        title="Web page" 
+                        frameborder="0" 
+                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
+                        allowfullscreen>
+                    </iframe>"""),
+                    show_label=True,
+                    visible=True
+                )
+
+            else:
+                output, results, js_code = run_code_interpreter(
+                    code, is_web_page)
+
+                if output:
+                    return gr.Markdown(value=output, visible=True), gr.HTML(value=results, visible=True), iframe_component
+                else:
+                    return gr.Markdown(value="TEST 2", visible=True), gr.HTML(value=results, visible=True), iframe_component
+
+    return gr.Markdown(value="TEST 3", visible=False), gr.HTML(visible=False), iframe_component
+
 def bot_response(
     state,
     temperature,
@@ -531,6 +681,14 @@ def bot_response(
                 return
         output = data["text"].strip()
         conv.update_last_message(output)
+
+        # Add a "Run in Sandbox" button to the last message if code is detected
+        last_message = state.conv.messages[-1]
+        if "```" in last_message[1]:
+            if not last_message[1].endswith("\n\n<button style='background-color: #4CAF50; border: none; color: white; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 12px;' onclick='runInSandbox()'>Run in Sandbox</button>"):
+                last_message[1] += "\n\n<button style='background-color: #4CAF50; border: none; color: white; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; border-radius: 12px;' onclick='runInSandbox()'>Run in Sandbox</button>"
+
+
         yield (state, state.to_gradio_chatbot()) + (enable_btn,) * 5
     except requests.exceptions.RequestException as e:
         conv.update_last_message(
@@ -851,6 +1009,26 @@ def build_single_model_ui(models, add_promotion_links=False):
             height=650,
             show_copy_button=True,
         )
+
+        # Add containers for the sandbox output and JavaScript
+        with gr.Row():
+            sandbox_output = gr.Markdown(value="", visible=False)
+            sandbox_render = gr.HTML(value="", visible=False)
+            sandbox_iframe = iFrame(
+                label="iFrame Example",
+                value=("""
+                    <iframe width="560" 
+                        height="315" 
+                        src="https://3000-ivj68uny6d2sma9tidd20-b0b684e9.e2b.dev" 
+                        title="YouTube video player" 
+                        frameborder="0" 
+                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
+                        allowfullscreen>
+                    </iframe>"""
+                ),
+                show_label=True,
+                visible=False)
+
     with gr.Row():
         textbox = gr.Textbox(
             show_label=False,
@@ -940,10 +1118,16 @@ def build_single_model_ui(models, add_promotion_links=False):
         [state, chatbot] + btn_list,
     )
 
-    return [state, model_selector]
+    # TODO:
+    chatbot.select(on_chat_click, [state], outputs=[
+                   sandbox_output, sandbox_render, sandbox_iframe
+                ])
+    return [
+        state, model_selector
+    ]
 
 
-def build_demo(models):
+def build_demo(models) -> gr.Blocks:
     with gr.Blocks(
         title="Chat with Open Large Language Models",
         theme=gr.themes.Default(),
@@ -951,7 +1135,9 @@ def build_demo(models):
     ) as demo:
         url_params = gr.JSON(visible=False)
 
-        state, model_selector = build_single_model_ui(models)
+        state, model_selector = build_single_model_ui(
+            models
+        )
 
         if args.model_list_mode not in ["once", "reload"]:
             raise ValueError(f"Unknown model list mode: {args.model_list_mode}")
@@ -970,6 +1156,20 @@ def build_demo(models):
             ],
             js=load_js,
         )
+
+        # Add a custom JavaScript function to handle sandbox execution
+        sandbox_js_code = """
+        function executeSandboxCode(code) {
+            // This function will be called when sandbox code needs to be executed
+            try {
+                eval(code);
+            } catch (error) {
+                console.error('Error executing sandbox code:', error);
+            }
+        }
+        """
+        demo.js = sandbox_js_code
+        print("Added custom JavaScript for sandbox execution")
 
     return demo
 
